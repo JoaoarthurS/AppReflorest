@@ -1,0 +1,133 @@
+################################################################################
+# .gitignore for Expo / React Native (TypeScript) project
+# Adds comprehensive ignores for caches, build outputs, OS/editor artifacts, logs,
+# secrets, and optional tooling. Adjust as needed for your team conventions.
+# Learn more: https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
+################################################################################
+
+# Dependencies
+node_modules/
+
+# Expo / Bundler
+.expo/
+.expo-shared/
+.expo-internal/
+dist/
+web-build/
+expo-env.d.ts
+*.expo/**
+
+# Metro / React Native caches and artifacts
+.metro-health-check*
+.metro-cache/
+metro-cache/
+.cache/
+*.packager.log
+*.jsbundle
+
+# Build outputs & reports
+build/
+out/
+android/app/build/
+ios/build/
+coverage/
+coverage-final.json
+.nyc_output/
+reports/
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# Native / Signing / Provisioning (keep secure items out of VCS)
+.kotlin/
+*.jks
+*.keystore
+*.p8
+*.p12
+*.key
+*.pem
+*.cer
+*.crt
+*.der
+*.mobileprovision
+*.pfx
+
+# Patch / merge temp files
+*.orig.*
+*.orig
+
+# Logs & diagnostics
+logs/
+*.log
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+pnpm-debug.log*
+lerna-debug.log*
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+hs_err_pid*
+profile-*
+
+# Environment files (retain an example for documentation)
+.env
+.env.*
+.env*.local
+!.env.example
+
+# OS junk
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editor / IDE settings (uncomment to ignore if desired)
+.vscode/
+.idea/
+*.iml
+
+# Lint / tooling caches
+.eslintcache
+.stylelintcache
+.ts-node
+.turbo/
+.tailwindcss/
+
+# Temporary & misc
+*.tmp
+*.temp
+tmp/
+temp/
+local/
+.local/
+
+# Storybook (if added)
+storybook-static/
+
+# Detox / E2E artifacts
+artifacts/
+
+# Fastlane outputs (if using fastlane and not versioning artifacts)
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/
+fastlane/test_output/
+
+# Image optimization cache
+.squoosh-cache/
+
+# Optional: lockfiles (COMMENTED OUT — keep them tracked normally for reproducible installs)
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
+# bun.lockb
+
+# Example app folder (exclude if only for local experimentation)
+app-example
+
+# Generated native folders (Expo managed workflow usually keeps these out)
+/ios
+/android
+
+################################################################################
+# End of file
+################################################################################
