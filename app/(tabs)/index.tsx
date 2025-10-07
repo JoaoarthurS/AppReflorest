@@ -1,3 +1,9 @@
+import {
+  TILE_PROVIDER_NAME,
+  buildTileUrl,
+  getTileRequestHeaders,
+  isTileProviderConfigured,
+} from '@/constants/mapTileProvider';
 import { Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as FileSystem from 'expo-file-system/legacy';
@@ -54,11 +60,14 @@ const OFFLINE_TILE_METADATA_KEY = 'offline_tile_metadata_v1';
 const REFRESH_DISTANCE_THRESHOLD_METERS = 5000;
 const REFRESH_TIME_THRESHOLD_MS = 7 * 24 * 60 * 60 * 1000;
 const NETWORK_POLL_INTERVAL_MS = 10000;
-const DEFAULT_LAT_PADDING = 0.02;
-const DEFAULT_LON_PADDING = 0.02;
+const TARGET_OFFLINE_AREA_SQ_KM = 5;
+const KM_PER_DEG_LAT = 110.574;
 const BOUNDS_TOLERANCE = 0.0005;
 
 const degToRad = (deg: number) => (deg * Math.PI) / 180;
+
+const kmPerDegreeLongitude = (latitude: number) =>
+  111.32 * Math.cos(degToRad(Math.min(Math.max(latitude, -90), 90)));
 
 const lonToTileX = (lon: number, zoom: number) => {
   const n = Math.pow(2, zoom);
@@ -113,18 +122,26 @@ const haversineDistance = (
 
 const createBoundsAroundCoords = (
   coords: Location.LocationObjectCoords,
-  latPadding = DEFAULT_LAT_PADDING,
-  lonPadding = DEFAULT_LON_PADDING
-): MapBounds => ({
-  northEast: {
-    latitude: coords.latitude + latPadding / 2,
-    longitude: coords.longitude + lonPadding / 2,
-  },
-  southWest: {
-    latitude: coords.latitude - latPadding / 2,
-    longitude: coords.longitude - lonPadding / 2,
-  },
-});
+  options: { areaSqKm?: number } = {}
+): MapBounds => {
+  const areaSqKm = options.areaSqKm ?? TARGET_OFFLINE_AREA_SQ_KM;
+  const safeArea = Math.max(areaSqKm, 0.25);
+  const sideKm = Math.sqrt(safeArea);
+  const latPadding = sideKm / KM_PER_DEG_LAT;
+  const kmPerLonDegree = Math.max(0.0001, kmPerDegreeLongitude(coords.latitude));
+  const lonPadding = sideKm / kmPerLonDegree;
+
+  return {
+    northEast: {
+      latitude: coords.latitude + latPadding / 2,
+      longitude: coords.longitude + lonPadding / 2,
+    },
+    southWest: {
+      latitude: coords.latitude - latPadding / 2,
+      longitude: coords.longitude - lonPadding / 2,
+    },
+  };
+};
 
 const normalizeBounds = (bounds: MapBounds): MapBounds => ({
   northEast: {
@@ -205,6 +222,28 @@ export default function HomeScreen() {
     [getOfflineTileFolderUri]
   );
 
+  const clearOfflineTiles = useCallback(async () => {
+    if (!supportsOfflineTiles || !offlineTileDirectoryUri) {
+      return;
+    }
+
+    try {
+      const directoryInfo = await FileSystem.getInfoAsync(offlineTileDirectoryUri);
+      if (directoryInfo.exists) {
+        await FileSystem.deleteAsync(offlineTileDirectoryUri, { idempotent: true });
+      }
+    } catch (error) {
+      console.error('Erro ao remover mapas offline antigos:', error);
+    } finally {
+      try {
+        await AsyncStorage.removeItem(OFFLINE_TILE_METADATA_KEY);
+      } catch (storageError) {
+        console.error('Erro ao limpar metadados de mapas offline:', storageError);
+      }
+      setHasOfflineTiles(false);
+    }
+  }, [supportsOfflineTiles, offlineTileDirectoryUri]);
+
   const loadSavedPolygons = useCallback(async () => {
     try {
       const savedPolygons = await AsyncStorage.getItem('saved_polygons');
@@ -249,6 +288,13 @@ export default function HomeScreen() {
         return false;
       }
 
+      const tileUrl = buildTileUrl(zoom, x, y);
+
+      if (!tileUrl) {
+        console.warn('Tile provider não configurado. Defina EXPO_PUBLIC_TILE_PROVIDER_URL.');
+        return false;
+      }
+
       await ensureDirectoryExists(baseDir);
       const tileInfo = await FileSystem.getInfoAsync(tilePath);
 
@@ -256,8 +302,9 @@ export default function HomeScreen() {
         return false;
       }
 
-      const tileUrl = `https://tile.openstreetmap.org/${zoom}/${x}/${y}.png`;
-      await FileSystem.downloadAsync(tileUrl, tilePath);
+      await FileSystem.downloadAsync(tileUrl, tilePath, {
+        headers: getTileRequestHeaders(),
+      });
       return true;
     },
     [ensureDirectoryExists, getOfflineTileFolderUri, getOfflineTilePathUri]
@@ -360,15 +407,30 @@ export default function HomeScreen() {
         return;
       }
 
-      if (!options.force) {
+      const isForced = options.force ?? false;
+
+      if (!isTileProviderConfigured()) {
+        const message = `Configure um provedor de tiles offline antes de salvar mapas (variável EXPO_PUBLIC_TILE_PROVIDER_URL).`;
+        console.warn(message);
+        setOfflineStatusMessage(message);
+        setTimeout(() => setOfflineStatusMessage(null), 4000);
+        return;
+      }
+
+      if (!isForced) {
         const needsRefresh = await shouldRefreshOfflineTiles({ bounds });
         if (!needsRefresh) {
           return;
         }
+      } else {
+        await clearOfflineTiles();
       }
 
       setIsPrefetchingTiles(true);
-      setOfflineStatusMessage('Baixando mapas offline para a área visível...');
+      const initialMessage = isForced
+        ? `Salvando mapa offline da região (${TILE_PROVIDER_NAME})...`
+        : `Atualizando mapas offline (${TILE_PROVIDER_NAME})...`;
+      setOfflineStatusMessage(initialMessage);
 
       let downloadedTiles = 0;
       const normalizedBounds = normalizeBounds(bounds);
@@ -417,14 +479,17 @@ export default function HomeScreen() {
         await AsyncStorage.setItem(OFFLINE_TILE_METADATA_KEY, JSON.stringify(metadata));
         await validateOfflineTiles(normalizedBounds);
 
-        setOfflineStatusMessage(
-          downloadedTiles > 0
-            ? `Mapas offline atualizados (${downloadedTiles} novos tiles).`
-            : 'Mapas offline já estavam atualizados para esta área.'
-        );
+        const successMessage = downloadedTiles > 0
+          ? isForced
+            ? `Mapa offline salvo (${downloadedTiles} novos tiles).`
+            : `Mapas offline atualizados (${downloadedTiles} novos tiles).`
+          : isForced
+            ? 'O mapa offline já estava atualizado para esta região.'
+            : 'Mapas offline já estavam atualizados para esta área.';
+        setOfflineStatusMessage(successMessage);
       } catch (error) {
         console.error('Erro ao baixar mapas offline:', error);
-        setOfflineStatusMessage('Falha ao baixar mapas offline. Tente novamente mais tarde.');
+        setOfflineStatusMessage('Falha ao salvar mapa offline. Tente novamente mais tarde.');
       } finally {
         setTimeout(() => setOfflineStatusMessage(null), 4000);
         setIsPrefetchingTiles(false);
@@ -437,6 +502,7 @@ export default function HomeScreen() {
       downloadTile,
       validateOfflineTiles,
       offlineTileDirectoryUri,
+      clearOfflineTiles,
     ]
   );
 
@@ -499,25 +565,53 @@ export default function HomeScreen() {
       return;
     }
 
-    const bounds = await getCurrentVisibleBounds();
+    try {
+      const networkState = await Network.getNetworkStateAsync();
+      if (isNetworkOffline(networkState)) {
+        Alert.alert('Sem conexão', 'Conecte-se à internet para salvar o mapa offline.');
+        return;
+      }
 
-    if (bounds) {
-      await downloadTilesForBounds(bounds, { force: true });
-      return;
+      if (!isTileProviderConfigured()) {
+        Alert.alert(
+          'Configuração necessária',
+          'Defina EXPO_PUBLIC_TILE_PROVIDER_URL (e chave, se aplicável) antes de salvar mapas offline.'
+        );
+        return;
+      }
+
+      let targetLocation: Location.LocationObject | null = null;
+
+      try {
+        targetLocation = await Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.Balanced,
+        });
+        setLocation(targetLocation);
+      } catch (locationError) {
+        console.warn('Falha ao obter localização atual, usando a última conhecida.', locationError);
+        if (location) {
+          targetLocation = location;
+        }
+      }
+
+      if (!targetLocation) {
+        Alert.alert('Erro', 'Não foi possível determinar a localização atual.');
+        return;
+      }
+
+      await downloadTilesAroundCoords(targetLocation.coords, { force: true });
+    } catch (error) {
+      console.error('Erro ao salvar mapa offline:', error);
+      setOfflineStatusMessage('Falha ao salvar mapa offline. Tente novamente.');
+      setTimeout(() => setOfflineStatusMessage(null), 4000);
+      Alert.alert('Erro', 'Não foi possível salvar o mapa offline. Tente novamente.');
     }
-
-    if (location) {
-      await downloadTilesAroundCoords(location.coords, { force: true });
-      return;
-    }
-
-    Alert.alert('Atenção', 'Não foi possível determinar a área atual do mapa.');
   }, [
     supportsOfflineTiles,
-    getCurrentVisibleBounds,
-    downloadTilesForBounds,
-    location,
     downloadTilesAroundCoords,
+    location,
+    setOfflineStatusMessage,
+    setLocation,
   ]);
 
   useEffect(() => {
@@ -1007,7 +1101,7 @@ export default function HomeScreen() {
                   isPrefetchingTiles && styles.menuItemTextDisabled,
                 ]}
               >
-                Baixar área visível
+                Salvar mapa offline
               </Text>
             </TouchableOpacity>
           )}

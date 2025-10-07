@@ -4,13 +4,13 @@ import { Ionicons } from '@expo/vector-icons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import React, { useEffect, useState } from 'react';
 import {
-    Alert,
-    FlatList,
-    RefreshControl,
-    StyleSheet,
-    Text,
-    TouchableOpacity,
-    View,
+  Alert,
+  FlatList,
+  RefreshControl,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
 } from 'react-native';
 
 interface Coordinate {
@@ -69,6 +69,7 @@ export default function TabTwoScreen() {
               setPolygons(updatedPolygons);
             } catch (error) {
               Alert.alert('Erro', 'Não foi possível excluir o polígono.');
+              console.error('Erro ao excluir polígono:', error);
             }
           },
         },
@@ -92,6 +93,7 @@ export default function TabTwoScreen() {
               Alert.alert('Sucesso', 'Todos os polígonos foram excluídos.');
             } catch (error) {
               Alert.alert('Erro', 'Não foi possível limpar o histórico.');
+              console.error('Erro ao limpar o histórico de polígonos:', error);
             }
           },
         },
