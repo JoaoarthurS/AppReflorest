@@ -3,11 +3,15 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Haptics from 'expo-haptics';
 import * as Location from 'expo-location';
+import type { NetworkState } from 'expo-network';
+import * as Network from 'expo-network';
 import * as Sharing from 'expo-sharing';
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  AppState,
+  AppStateStatus,
   Dimensions,
   Platform,
   StyleSheet,
@@ -15,7 +19,7 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import MapView, { Marker, Polygon } from 'react-native-maps';
+import MapView, { LocalTile, Marker, Polygon } from 'react-native-maps';
 
 interface Coordinate {
   latitude: number;
@@ -31,7 +35,124 @@ interface PolygonData {
   createdAt: number;
 }
 
+interface MapBounds {
+  northEast: { latitude: number; longitude: number };
+  southWest: { latitude: number; longitude: number };
+}
+
+interface OfflineTileMetadata {
+  center: { latitude: number; longitude: number };
+  bounds?: MapBounds;
+  downloadedAt: number;
+  zoomLevels: number[];
+}
+
 const { width, height } = Dimensions.get('window');
+
+const TILE_ZOOMS = [13, 14, 15];
+const OFFLINE_TILE_METADATA_KEY = 'offline_tile_metadata_v1';
+const REFRESH_DISTANCE_THRESHOLD_METERS = 5000;
+const REFRESH_TIME_THRESHOLD_MS = 7 * 24 * 60 * 60 * 1000;
+const NETWORK_POLL_INTERVAL_MS = 10000;
+const DEFAULT_LAT_PADDING = 0.02;
+const DEFAULT_LON_PADDING = 0.02;
+const BOUNDS_TOLERANCE = 0.0005;
+
+const degToRad = (deg: number) => (deg * Math.PI) / 180;
+
+const lonToTileX = (lon: number, zoom: number) => {
+  const n = Math.pow(2, zoom);
+  return Math.floor(((lon + 180) / 360) * n);
+};
+
+const latToTileY = (lat: number, zoom: number) => {
+  const latRad = degToRad(lat);
+  const n = Math.pow(2, zoom);
+  return Math.floor(
+    ((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n
+  );
+};
+
+const isNetworkOffline = (state: NetworkState | null) => {
+  if (!state) {
+    return false;
+  }
+
+  const isConnected = state.isConnected ?? false;
+  const isInternetReachable = state.isInternetReachable;
+
+  if (!isConnected) {
+    return true;
+  }
+
+  if (typeof isInternetReachable === 'boolean') {
+    return !isInternetReachable;
+  }
+
+  return false;
+};
+
+const haversineDistance = (
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number
+) => {
+  const R = 6371000;
+  const dLat = degToRad(lat2 - lat1);
+  const dLon = degToRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(degToRad(lat1)) *
+      Math.cos(degToRad(lat2)) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+};
+
+const createBoundsAroundCoords = (
+  coords: Location.LocationObjectCoords,
+  latPadding = DEFAULT_LAT_PADDING,
+  lonPadding = DEFAULT_LON_PADDING
+): MapBounds => ({
+  northEast: {
+    latitude: coords.latitude + latPadding / 2,
+    longitude: coords.longitude + lonPadding / 2,
+  },
+  southWest: {
+    latitude: coords.latitude - latPadding / 2,
+    longitude: coords.longitude - lonPadding / 2,
+  },
+});
+
+const normalizeBounds = (bounds: MapBounds): MapBounds => ({
+  northEast: {
+    latitude: Math.max(bounds.northEast.latitude, bounds.southWest.latitude),
+    longitude: Math.max(bounds.northEast.longitude, bounds.southWest.longitude),
+  },
+  southWest: {
+    latitude: Math.min(bounds.northEast.latitude, bounds.southWest.latitude),
+    longitude: Math.min(bounds.northEast.longitude, bounds.southWest.longitude),
+  },
+});
+
+const getBoundsCenter = (bounds: MapBounds) => ({
+  latitude: (bounds.northEast.latitude + bounds.southWest.latitude) / 2,
+  longitude: (bounds.northEast.longitude + bounds.southWest.longitude) / 2,
+});
+
+const isBoundsContained = (container: MapBounds, target: MapBounds) => {
+  const normalizedContainer = normalizeBounds(container);
+  const normalizedTarget = normalizeBounds(target);
+
+  return (
+    normalizedContainer.northEast.latitude + BOUNDS_TOLERANCE >= normalizedTarget.northEast.latitude &&
+    normalizedContainer.northEast.longitude + BOUNDS_TOLERANCE >= normalizedTarget.northEast.longitude &&
+    normalizedContainer.southWest.latitude - BOUNDS_TOLERANCE <= normalizedTarget.southWest.latitude &&
+    normalizedContainer.southWest.longitude - BOUNDS_TOLERANCE <= normalizedTarget.southWest.longitude
+  );
+};
 
 export default function HomeScreen() {
   const [location, setLocation] = useState<Location.LocationObject | null>(null);
@@ -42,9 +163,362 @@ export default function HomeScreen() {
   const [showMenu, setShowMenu] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [permissionDenied, setPermissionDenied] = useState(false);
-  // Tipo de visualização do mapa: 'standard' | 'satellite'
-  const [mapType, setMapType] = useState<'standard' | 'satellite'>('standard');
+  const [preferredMapType, setPreferredMapType] = useState<'standard' | 'satellite'>('standard');
+  const [isOffline, setIsOffline] = useState(false);
+  const [hasOfflineTiles, setHasOfflineTiles] = useState(false);
+  const [isPrefetchingTiles, setIsPrefetchingTiles] = useState(false);
+  const [offlineStatusMessage, setOfflineStatusMessage] = useState<string | null>(null);
+  const supportsOfflineTiles = Platform.OS !== 'web';
   const mapRef = useRef<MapView>(null);
+  const offlineTileDirectoryUri = React.useMemo(() => {
+    if (!supportsOfflineTiles || !FileSystem.documentDirectory) {
+      return null;
+    }
+    return `${FileSystem.documentDirectory}offlineTiles`;
+  }, [supportsOfflineTiles]);
+
+  const offlineTileDirectoryPath = React.useMemo(() => {
+    if (!offlineTileDirectoryUri) {
+      return null;
+    }
+    return offlineTileDirectoryUri.replace('file://', '');
+  }, [offlineTileDirectoryUri]);
+
+  const offlineTilePathTemplate = React.useMemo(() => {
+    if (!offlineTileDirectoryPath) {
+      return null;
+    }
+    return `${offlineTileDirectoryPath}/{z}/{x}/{y}.png`;
+  }, [offlineTileDirectoryPath]);
+
+  const getOfflineTileFolderUri = useCallback(
+    (zoom: number, x: number) =>
+      offlineTileDirectoryUri ? `${offlineTileDirectoryUri}/${zoom}/${x}` : null,
+    [offlineTileDirectoryUri]
+  );
+
+  const getOfflineTilePathUri = useCallback(
+    (zoom: number, x: number, y: number) => {
+      const folderUri = getOfflineTileFolderUri(zoom, x);
+      return folderUri ? `${folderUri}/${y}.png` : null;
+    },
+    [getOfflineTileFolderUri]
+  );
+
+  const loadSavedPolygons = useCallback(async () => {
+    try {
+      const savedPolygons = await AsyncStorage.getItem('saved_polygons');
+      if (savedPolygons) {
+        setPolygons(JSON.parse(savedPolygons));
+      }
+    } catch (error) {
+      console.error('Erro ao carregar polígonos:', error);
+    }
+  }, []);
+
+  const savePolygon = useCallback(
+    async (polygonData: PolygonData) => {
+      try {
+        const updatedPolygons = [...polygons, polygonData];
+        await AsyncStorage.setItem('saved_polygons', JSON.stringify(updatedPolygons));
+        setPolygons(updatedPolygons);
+      } catch (error) {
+        console.error('Erro ao salvar polígono:', error);
+      }
+    },
+    [polygons]
+  );
+
+  const ensureDirectoryExists = useCallback(async (directoryPath: string | null) => {
+    if (!directoryPath) {
+      return;
+    }
+
+    const directoryInfo = await FileSystem.getInfoAsync(directoryPath);
+    if (!directoryInfo.exists) {
+      await FileSystem.makeDirectoryAsync(directoryPath, { intermediates: true });
+    }
+  }, []);
+
+  const downloadTile = useCallback(
+    async (zoom: number, x: number, y: number) => {
+      const baseDir = getOfflineTileFolderUri(zoom, x);
+      const tilePath = getOfflineTilePathUri(zoom, x, y);
+
+      if (!baseDir || !tilePath) {
+        return false;
+      }
+
+      await ensureDirectoryExists(baseDir);
+      const tileInfo = await FileSystem.getInfoAsync(tilePath);
+
+      if (tileInfo.exists) {
+        return false;
+      }
+
+      const tileUrl = `https://tile.openstreetmap.org/${zoom}/${x}/${y}.png`;
+      await FileSystem.downloadAsync(tileUrl, tilePath);
+      return true;
+    },
+    [ensureDirectoryExists, getOfflineTileFolderUri, getOfflineTilePathUri]
+  );
+
+  const shouldRefreshOfflineTiles = useCallback(
+    async (params: { coords?: Location.LocationObjectCoords; bounds?: MapBounds }) => {
+      try {
+        const metadataString = await AsyncStorage.getItem(OFFLINE_TILE_METADATA_KEY);
+        if (!metadataString) {
+          return true;
+        }
+
+        const metadata = JSON.parse(metadataString) as OfflineTileMetadata;
+
+        if (params.bounds) {
+          if (!metadata.bounds) {
+            return true;
+          }
+
+          if (!isBoundsContained(metadata.bounds, params.bounds)) {
+            return true;
+          }
+        }
+
+        if (params.coords) {
+          const distance = haversineDistance(
+            params.coords.latitude,
+            params.coords.longitude,
+            metadata.center.latitude,
+            metadata.center.longitude
+          );
+          const elapsed = Date.now() - metadata.downloadedAt;
+
+          if (
+            distance > REFRESH_DISTANCE_THRESHOLD_METERS ||
+            elapsed > REFRESH_TIME_THRESHOLD_MS
+          ) {
+            return true;
+          }
+        }
+
+        return false;
+      } catch (error) {
+        console.error('Erro ao analisar metadados de mapas offline:', error);
+        return true;
+      }
+    },
+    []
+  );
+
+  const validateOfflineTiles = useCallback(
+    async (coordsOrBounds?: Location.LocationObjectCoords | MapBounds) => {
+      try {
+        const metadataString = await AsyncStorage.getItem(OFFLINE_TILE_METADATA_KEY);
+        if (!metadataString) {
+          setHasOfflineTiles(false);
+          return;
+        }
+
+        const metadata = JSON.parse(metadataString) as OfflineTileMetadata;
+        const referenceCenter = (() => {
+          if (coordsOrBounds) {
+            if ('northEast' in coordsOrBounds) {
+              return getBoundsCenter(coordsOrBounds as MapBounds);
+            }
+            return {
+              latitude: coordsOrBounds.latitude,
+              longitude: (coordsOrBounds as Location.LocationObjectCoords).longitude,
+            };
+          }
+          if (metadata.bounds) {
+            return getBoundsCenter(metadata.bounds);
+          }
+          return metadata.center;
+        })();
+
+        const referenceZoom = metadata.zoomLevels?.[0] ?? TILE_ZOOMS[0];
+        const tileX = lonToTileX(referenceCenter.longitude, referenceZoom);
+        const tileY = latToTileY(referenceCenter.latitude, referenceZoom);
+        const tilePath = getOfflineTilePathUri(referenceZoom, tileX, tileY);
+        if (!tilePath) {
+          setHasOfflineTiles(false);
+          return;
+        }
+
+        const tileInfo = await FileSystem.getInfoAsync(tilePath);
+        setHasOfflineTiles(tileInfo.exists);
+      } catch (error) {
+        console.error('Erro ao validar mapas offline:', error);
+        setHasOfflineTiles(false);
+      }
+    },
+    [getOfflineTilePathUri]
+  );
+
+  const downloadTilesForBounds = useCallback(
+    async (bounds: MapBounds, options: { force?: boolean } = {}) => {
+      if (!supportsOfflineTiles || isPrefetchingTiles || !offlineTileDirectoryUri) {
+        return;
+      }
+
+      if (!options.force) {
+        const needsRefresh = await shouldRefreshOfflineTiles({ bounds });
+        if (!needsRefresh) {
+          return;
+        }
+      }
+
+      setIsPrefetchingTiles(true);
+      setOfflineStatusMessage('Baixando mapas offline para a área visível...');
+
+      let downloadedTiles = 0;
+      const normalizedBounds = normalizeBounds(bounds);
+
+      try {
+        for (const zoom of TILE_ZOOMS) {
+          const xStart = Math.min(
+            lonToTileX(normalizedBounds.southWest.longitude, zoom),
+            lonToTileX(normalizedBounds.northEast.longitude, zoom)
+          );
+          const xEnd = Math.max(
+            lonToTileX(normalizedBounds.southWest.longitude, zoom),
+            lonToTileX(normalizedBounds.northEast.longitude, zoom)
+          );
+          const yStart = Math.min(
+            latToTileY(normalizedBounds.northEast.latitude, zoom),
+            latToTileY(normalizedBounds.southWest.latitude, zoom)
+          );
+          const yEnd = Math.max(
+            latToTileY(normalizedBounds.northEast.latitude, zoom),
+            latToTileY(normalizedBounds.southWest.latitude, zoom)
+          );
+
+          for (let tileX = xStart; tileX <= xEnd; tileX++) {
+            for (let tileY = yStart; tileY <= yEnd; tileY++) {
+              const maxTileIndex = Math.pow(2, zoom) - 1;
+              if (tileX < 0 || tileY < 0 || tileX > maxTileIndex || tileY > maxTileIndex) {
+                continue;
+              }
+
+              const didDownload = await downloadTile(zoom, tileX, tileY);
+              if (didDownload) {
+                downloadedTiles += 1;
+              }
+            }
+          }
+        }
+
+        const metadata: OfflineTileMetadata = {
+          center: getBoundsCenter(normalizedBounds),
+          bounds: normalizedBounds,
+          downloadedAt: Date.now(),
+          zoomLevels: TILE_ZOOMS,
+        };
+
+        await AsyncStorage.setItem(OFFLINE_TILE_METADATA_KEY, JSON.stringify(metadata));
+        await validateOfflineTiles(normalizedBounds);
+
+        setOfflineStatusMessage(
+          downloadedTiles > 0
+            ? `Mapas offline atualizados (${downloadedTiles} novos tiles).`
+            : 'Mapas offline já estavam atualizados para esta área.'
+        );
+      } catch (error) {
+        console.error('Erro ao baixar mapas offline:', error);
+        setOfflineStatusMessage('Falha ao baixar mapas offline. Tente novamente mais tarde.');
+      } finally {
+        setTimeout(() => setOfflineStatusMessage(null), 4000);
+        setIsPrefetchingTiles(false);
+      }
+    },
+    [
+      supportsOfflineTiles,
+      isPrefetchingTiles,
+      shouldRefreshOfflineTiles,
+      downloadTile,
+      validateOfflineTiles,
+      offlineTileDirectoryUri,
+    ]
+  );
+
+  const downloadTilesAroundCoords = useCallback(
+    async (coords: Location.LocationObjectCoords, options: { force?: boolean } = {}) => {
+      const bounds = createBoundsAroundCoords(coords);
+      await downloadTilesForBounds(bounds, options);
+    },
+    [downloadTilesForBounds]
+  );
+
+  const getCurrentVisibleBounds = useCallback(async (): Promise<MapBounds | null> => {
+    if (!mapRef.current?.getMapBoundaries) {
+      return null;
+    }
+
+    try {
+      const bounds = await mapRef.current.getMapBoundaries();
+      return normalizeBounds(bounds as MapBounds);
+    } catch (error) {
+      console.error('Erro ao obter limites do mapa:', error);
+      return null;
+    }
+  }, []);
+
+  const ensureOfflineTiles = useCallback(
+    async (coords: Location.LocationObjectCoords) => {
+      if (!supportsOfflineTiles) {
+        return;
+      }
+
+      try {
+        const networkState = await Network.getNetworkStateAsync();
+        if (isNetworkOffline(networkState)) {
+          return;
+        }
+
+        const currentBounds = await getCurrentVisibleBounds();
+        if (currentBounds) {
+          await downloadTilesForBounds(currentBounds);
+          return;
+        }
+
+        await downloadTilesAroundCoords(coords);
+      } catch (error) {
+        console.error('Erro ao garantir mapas offline:', error);
+      }
+    },
+    [
+      supportsOfflineTiles,
+      getCurrentVisibleBounds,
+      downloadTilesForBounds,
+      downloadTilesAroundCoords,
+    ]
+  );
+
+  const manuallyRefreshOfflineTiles = useCallback(async () => {
+    if (!supportsOfflineTiles) {
+      Alert.alert('Indisponível', 'Este recurso não está disponível nesta plataforma.');
+      return;
+    }
+
+    const bounds = await getCurrentVisibleBounds();
+
+    if (bounds) {
+      await downloadTilesForBounds(bounds, { force: true });
+      return;
+    }
+
+    if (location) {
+      await downloadTilesAroundCoords(location.coords, { force: true });
+      return;
+    }
+
+    Alert.alert('Atenção', 'Não foi possível determinar a área atual do mapa.');
+  }, [
+    supportsOfflineTiles,
+    getCurrentVisibleBounds,
+    downloadTilesForBounds,
+    location,
+    downloadTilesAroundCoords,
+  ]);
 
   useEffect(() => {
     (async () => {
@@ -57,14 +531,18 @@ export default function HomeScreen() {
           return;
         }
 
-        const location = await Location.getCurrentPositionAsync({
+        const currentLocation = await Location.getCurrentPositionAsync({
           accuracy: Location.Accuracy.High,
         });
-        setLocation(location);
-        
-        // Carregar polígonos salvos
+        setLocation(currentLocation);
+
         await loadSavedPolygons();
-        
+
+        if (supportsOfflineTiles) {
+          await ensureOfflineTiles(currentLocation.coords);
+          await validateOfflineTiles(currentLocation.coords);
+        }
+
         setIsLoading(false);
       } catch (error) {
         console.error('Erro ao obter localização:', error);
@@ -72,47 +550,127 @@ export default function HomeScreen() {
         Alert.alert('Erro', 'Não foi possível obter a localização. Verifique se o GPS está ativo.');
       }
     })();
-  }, []);
+  }, [supportsOfflineTiles, loadSavedPolygons, ensureOfflineTiles, validateOfflineTiles]);
 
-  const loadSavedPolygons = async () => {
-    try {
-      const savedPolygons = await AsyncStorage.getItem('saved_polygons');
-      if (savedPolygons) {
-        setPolygons(JSON.parse(savedPolygons));
+  useEffect(() => {
+    if (!supportsOfflineTiles) {
+      return;
+    }
+
+    let isMounted = true;
+
+    const syncNetworkState = async () => {
+      try {
+        const networkState = await Network.getNetworkStateAsync();
+        if (isMounted) {
+          setIsOffline(isNetworkOffline(networkState));
+        }
+      } catch (error) {
+        console.error('Erro ao obter estado de rede:', error);
       }
-    } catch (error) {
-      console.error('Erro ao carregar polígonos:', error);
-    }
-  };
+    };
 
-  const savePolygon = async (polygonData: PolygonData) => {
-    try {
-      const updatedPolygons = [...polygons, polygonData];
-      await AsyncStorage.setItem('saved_polygons', JSON.stringify(updatedPolygons));
-      setPolygons(updatedPolygons);
-    } catch (error) {
-      console.error('Erro ao salvar polígono:', error);
+    syncNetworkState();
+    const intervalId = setInterval(syncNetworkState, NETWORK_POLL_INTERVAL_MS);
+    const subscription = AppState.addEventListener('change', (nextState: AppStateStatus) => {
+      if (nextState === 'active') {
+        syncNetworkState();
+      }
+    });
+
+    return () => {
+      isMounted = false;
+      clearInterval(intervalId);
+      subscription.remove();
+    };
+  }, [supportsOfflineTiles]);
+
+  useEffect(() => {
+    if (!supportsOfflineTiles || !location) {
+      return;
     }
-  };
+
+    let cancelled = false;
+
+    (async () => {
+      try {
+        await ensureOfflineTiles(location.coords);
+        if (!cancelled) {
+          const bounds = (await getCurrentVisibleBounds()) ?? createBoundsAroundCoords(location.coords);
+          await validateOfflineTiles(bounds);
+        }
+      } catch (error) {
+        console.error('Erro ao preparar mapas offline:', error);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    supportsOfflineTiles,
+    location,
+    ensureOfflineTiles,
+    validateOfflineTiles,
+    getCurrentVisibleBounds,
+  ]);
+
+  useEffect(() => {
+    if (!supportsOfflineTiles || !location || isOffline) {
+      return;
+    }
+
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const bounds = await getCurrentVisibleBounds();
+        const needsUpdate = await shouldRefreshOfflineTiles(
+          bounds ? { bounds } : { coords: location.coords }
+        );
+
+        if (!cancelled && needsUpdate) {
+          if (bounds) {
+            await downloadTilesForBounds(bounds);
+          } else {
+            await downloadTilesAroundCoords(location.coords);
+          }
+        }
+      } catch (error) {
+        console.error('Erro ao atualizar mapas offline ao recuperar conexão:', error);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    supportsOfflineTiles,
+    location,
+    isOffline,
+    getCurrentVisibleBounds,
+    shouldRefreshOfflineTiles,
+    downloadTilesForBounds,
+    downloadTilesAroundCoords,
+  ]);
 
   const capturePoint = async () => {
     if (isCapturing) return;
-    
+
     setIsCapturing(true);
-    
+
     try {
-      // Vibração de feedback
       if (Platform.OS !== 'web') {
         await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
       }
 
-      const location = await Location.getCurrentPositionAsync({
+      const currentLocation = await Location.getCurrentPositionAsync({
         accuracy: Location.Accuracy.High,
       });
 
       const newCoordinate: Coordinate = {
-        latitude: location.coords.latitude,
-        longitude: location.coords.longitude,
+        latitude: currentLocation.coords.latitude,
+        longitude: currentLocation.coords.longitude,
         timestamp: Date.now(),
         id: `point_${Date.now()}`,
       };
@@ -121,11 +679,10 @@ export default function HomeScreen() {
       setCoordinates(updatedCoordinates);
       setCurrentPolygon(updatedCoordinates);
 
-      // Centralizar mapa no novo ponto
       if (mapRef.current) {
         mapRef.current.animateToRegion({
-          latitude: location.coords.latitude,
-          longitude: location.coords.longitude,
+          latitude: currentLocation.coords.latitude,
+          longitude: currentLocation.coords.longitude,
           latitudeDelta: 0.01,
           longitudeDelta: 0.01,
         });
@@ -323,6 +880,12 @@ export default function HomeScreen() {
               setLocation(location);
               
               await loadSavedPolygons();
+
+              if (supportsOfflineTiles) {
+                await ensureOfflineTiles(location.coords);
+                await validateOfflineTiles(location.coords);
+              }
+
               setIsLoading(false);
             } catch (error) {
               console.error('Erro ao obter localização:', error);
@@ -349,10 +912,29 @@ export default function HomeScreen() {
             latitudeDelta: 0.01,
             longitudeDelta: 0.01,
           }}
-          showsUserLocation={true}
+          showsUserLocation
           showsMyLocationButton={false}
-          mapType={mapType}
+          zoomEnabled
+          mapType={supportsOfflineTiles && isOffline && hasOfflineTiles ? 'none' : preferredMapType}
+          onRegionChangeComplete={async () => {
+            if (!supportsOfflineTiles || isOffline) {
+              return;
+            }
+
+            try {
+              const bounds = await getCurrentVisibleBounds();
+              if (bounds) {
+                await validateOfflineTiles(bounds);
+              }
+            } catch (error) {
+              console.error('Erro ao validar mapas offline após mudança de região:', error);
+            }
+          }}
         >
+          {supportsOfflineTiles && isOffline && hasOfflineTiles && offlineTilePathTemplate && (
+            <LocalTile pathTemplate={offlineTilePathTemplate} tileSize={256} zIndex={1} />
+          )}
+
           {coordinates.map((coord, index) => (
             <Marker
               key={coord.id}
@@ -387,7 +969,6 @@ export default function HomeScreen() {
         </MapView>
       )}
 
-      {/* Menu Hambúrguer */}
       <TouchableOpacity
         style={styles.menuButton}
         onPress={() => setShowMenu(!showMenu)}
@@ -397,12 +978,40 @@ export default function HomeScreen() {
 
       {showMenu && (
         <View style={styles.menuOverlay}>
-          <TouchableOpacity style={styles.menuItem} onPress={() => setMapType(mapType === 'standard' ? 'satellite' : 'standard')}>
-            <Ionicons name={mapType === 'standard' ? 'planet' : 'map'} size={20} color="#333" />
+          <TouchableOpacity
+            style={styles.menuItem}
+            onPress={() =>
+              setPreferredMapType(preferredMapType === 'standard' ? 'satellite' : 'standard')
+            }
+          >
+            <Ionicons name={preferredMapType === 'standard' ? 'planet' : 'map'} size={20} color="#333" />
             <Text style={styles.menuItemText}>
-              {mapType === 'standard' ? 'Satélite' : 'Mapa Padrão'}
+              {preferredMapType === 'standard' ? 'Satélite' : 'Mapa Padrão'}
             </Text>
           </TouchableOpacity>
+
+          {supportsOfflineTiles && !isOffline && (
+            <TouchableOpacity
+              style={[styles.menuItem, isPrefetchingTiles && styles.menuItemDisabled]}
+              onPress={manuallyRefreshOfflineTiles}
+              disabled={isPrefetchingTiles}
+            >
+              <Ionicons
+                name="download"
+                size={20}
+                color={isPrefetchingTiles ? '#999' : '#333'}
+              />
+              <Text
+                style={[
+                  styles.menuItemText,
+                  isPrefetchingTiles && styles.menuItemTextDisabled,
+                ]}
+              >
+                Baixar área visível
+              </Text>
+            </TouchableOpacity>
+          )}
+
           <TouchableOpacity style={styles.menuItem} onPress={clearAll}>
             <Ionicons name="trash" size={20} color="red" />
             <Text style={styles.menuItemText}>Limpar Tudo</Text>
@@ -414,7 +1023,23 @@ export default function HomeScreen() {
         </View>
       )}
 
-      {/* Botão Principal de Captura */}
+      {supportsOfflineTiles && isOffline && (
+        <View style={styles.offlineBadge}>
+          <Ionicons name="cloud-offline" size={16} color="#fff" />
+          <Text style={styles.offlineBadgeText}>
+            Modo offline {hasOfflineTiles ? 'com mapas salvos' : 'sem mapas salvos'}
+          </Text>
+        </View>
+      )}
+
+      {supportsOfflineTiles && isOffline && !hasOfflineTiles && (
+        <View style={styles.offlineNotice}>
+          <Text style={styles.offlineNoticeText}>
+            Mapas offline indisponíveis. Conecte-se à internet e baixe a área visível antes de sair.
+          </Text>
+        </View>
+      )}
+
       <TouchableOpacity
         style={[styles.captureButton, isCapturing && styles.captureButtonDisabled]}
         onPress={capturePoint}
@@ -430,14 +1055,13 @@ export default function HomeScreen() {
         )}
       </TouchableOpacity>
 
-      {/* Barra Inferior */}
       <View style={styles.bottomBar}>
         <TouchableOpacity
           style={[styles.bottomButton, coordinates.length === 0 && styles.bottomButtonDisabled]}
           onPress={undoLastPoint}
           disabled={coordinates.length === 0}
         >
-          <Ionicons name="arrow-undo" size={20} color={coordinates.length === 0 ? "#ccc" : "#fff"} />
+          <Ionicons name="arrow-undo" size={20} color={coordinates.length === 0 ? '#ccc' : '#fff'} />
           <Text style={[styles.bottomButtonText, coordinates.length === 0 && styles.bottomButtonTextDisabled]}>
             DESFAZER
           </Text>
@@ -454,23 +1078,43 @@ export default function HomeScreen() {
           onPress={finishPolygon}
           disabled={coordinates.length < 3}
         >
-          <Ionicons name="checkmark-circle" size={20} color={coordinates.length < 3 ? "#ccc" : "#fff"} />
+          <Ionicons name="checkmark-circle" size={20} color={coordinates.length < 3 ? '#ccc' : '#fff'} />
           <Text style={[styles.bottomButtonText, coordinates.length < 3 && styles.bottomButtonTextDisabled]}>
             FINALIZAR
           </Text>
         </TouchableOpacity>
 
         <TouchableOpacity
-          style={[styles.bottomButton, (polygons.length === 0 && coordinates.length === 0) && styles.bottomButtonDisabled]}
+          style={[styles.bottomButton, polygons.length === 0 && coordinates.length === 0 && styles.bottomButtonDisabled]}
           onPress={exportKML}
           disabled={polygons.length === 0 && coordinates.length === 0}
         >
-          <Ionicons name="share" size={20} color={(polygons.length === 0 && coordinates.length === 0) ? "#ccc" : "#fff"} />
-          <Text style={[styles.bottomButtonText, (polygons.length === 0 && coordinates.length === 0) && styles.bottomButtonTextDisabled]}>
+          <Ionicons
+            name="share"
+            size={20}
+            color={polygons.length === 0 && coordinates.length === 0 ? '#ccc' : '#fff'}
+          />
+          <Text
+            style={[
+              styles.bottomButtonText,
+              polygons.length === 0 && coordinates.length === 0 && styles.bottomButtonTextDisabled,
+            ]}
+          >
             EXPORTAR
           </Text>
         </TouchableOpacity>
       </View>
+
+      {offlineStatusMessage && supportsOfflineTiles && (
+        <View style={styles.offlineStatusToast}>
+          <View style={styles.offlineStatusToastContent}>
+            {isPrefetchingTiles && (
+              <ActivityIndicator size="small" color="#fff" style={styles.offlineSpinner} />
+            )}
+            <Text style={styles.offlineStatusToastText}>{offlineStatusMessage}</Text>
+          </View>
+        </View>
+      )}
     </View>
   );
 }
@@ -515,9 +1159,15 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     paddingHorizontal: 15,
   },
+  menuItemDisabled: {
+    opacity: 0.6,
+  },
   menuItemText: {
     marginLeft: 10,
     fontSize: 16,
+  },
+  menuItemTextDisabled: {
+    color: '#999',
   },
   captureButton: {
     position: 'absolute',
@@ -648,5 +1298,61 @@ const styles = StyleSheet.create({
     color: 'white',
     fontSize: 16,
     fontWeight: 'bold',
+  },
+  offlineBadge: {
+    position: 'absolute',
+    top: 50,
+    right: 20,
+    backgroundColor: 'rgba(0,0,0,0.8)',
+    borderRadius: 18,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    zIndex: 1100,
+  },
+  offlineBadgeText: {
+    color: 'white',
+    marginLeft: 8,
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  offlineNotice: {
+    position: 'absolute',
+    top: 110,
+    left: 20,
+    right: 20,
+    backgroundColor: 'rgba(0,0,0,0.75)',
+    padding: 12,
+    borderRadius: 12,
+    zIndex: 1050,
+  },
+  offlineNoticeText: {
+    color: '#fff',
+    fontSize: 12,
+    lineHeight: 16,
+    textAlign: 'center',
+  },
+  offlineStatusToast: {
+    position: 'absolute',
+    bottom: 230,
+    alignSelf: 'center',
+    backgroundColor: 'rgba(0,0,0,0.85)',
+    paddingVertical: 10,
+    paddingHorizontal: 18,
+    borderRadius: 22,
+    zIndex: 1200,
+  },
+  offlineStatusToastContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  offlineStatusToastText: {
+    color: '#fff',
+    fontSize: 12,
+    textAlign: 'center',
+  },
+  offlineSpinner: {
+    marginRight: 8,
   },
 });
