@@ -1,8 +1,8 @@
 const MAPBOX_DEFAULT_STYLE_URL =
-  'https://api.mapbox.com/styles/v1/mapbox/streets-v12/tiles/256/{z}/{x}/{y}?access_token={apiKey}';
+  'https://api.mapbox.com/styles/v1/mapbox/satellite-streets-v12/tiles/256/{z}/{x}/{y}?access_token={apiKey}';
 const MAPBOX_DEFAULT_TOKEN =
   'pk.eyJ1Ijoiam9hb2FydGh1cnNvdXphc2FudG9zIiwiYSI6ImNtY29xYWtmdTBpZzQycG9tZ2g0ZHk4NHAifQ.BF849wNk7PIUM1MI3c9ghg';
-const MAPBOX_DEFAULT_NAME = 'Mapbox Streets';
+const MAPBOX_DEFAULT_NAME = 'Mapbox Satellite';
 const MAPBOX_DEFAULT_USER_AGENT = 'AppReflorest/1.0 (mapbox)';
 
 export const TILE_PROVIDER_URL_TEMPLATE =
